@@ -255,7 +255,7 @@ def main():
     )
 
     max_steps = args.max_steps
-    eval_interval = 999
+    eval_interval = 99
     warmup_steps = min(99, max(0, max_steps - 1))
 
     def get_lr(step):
