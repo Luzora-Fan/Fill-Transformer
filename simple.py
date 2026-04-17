@@ -190,7 +190,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-steps", type=int, default=3171)
+    parser.add_argument("--max-steps", type=int, default=9999)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--checkpoint", type=str, default="simple_checkpoint.pt")
     args = parser.parse_args()
@@ -221,7 +221,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,
@@ -231,7 +231,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,
