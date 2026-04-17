@@ -191,7 +191,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-steps", type=int, default=3171)
-    parser.add_argument("--batch-size", type=int, default=44)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--checkpoint", type=str, default="simple_checkpoint.pt")
     args = parser.parse_args()
     
@@ -255,7 +255,7 @@ def main():
     )
 
     max_steps = args.max_steps
-    eval_interval = 99
+    eval_interval = 999
     warmup_steps = min(99, max(0, max_steps - 1))
 
     def get_lr(step):
