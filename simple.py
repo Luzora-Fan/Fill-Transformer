@@ -280,10 +280,10 @@ def main():
     parser = argparse.ArgumentParser(description="SimpleTransformerLM — TinyStories")
  
     # Training
-    parser.add_argument("--max-steps",    type=int,   default=720)
-    parser.add_argument("--batch-size",   type=int,   default=192,
+    parser.add_argument("--max-steps",    type=int,   default=9999)
+    parser.add_argument("--batch-size",   type=int,   default=99,
                         help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
-    parser.add_argument("--block-size",   type=int,   default=512)
+    parser.add_argument("--block-size",   type=int,   default=1024)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"],
