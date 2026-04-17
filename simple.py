@@ -191,7 +191,7 @@ def estimate_loss(model, val_loader, vocab_size, device, eval_iters=20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-steps", type=int, default=3171)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--checkpoint", type=str, default="simple_checkpoint.pt")
     args = parser.parse_args()
     
