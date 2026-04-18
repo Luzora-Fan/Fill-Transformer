@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
-from modules.utils import load_hf_dataset, save_checkpoint
+from modules.utils import load_checkpoint, load_hf_dataset, save_checkpoint
 
 # EPYC 9355: 48 cores / 96 threads. Cap PyTorch + MKL thread pools to avoid
 # contention with DataLoader workers (we use 12 workers below).
@@ -111,16 +111,31 @@ class SimpleTransformerLM(nn.Module):
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
 
+            past_len = 0
             if past_kvs is not None:
                 past_k, past_v = past_kvs[layer]
+                past_len = past_k.size(2)
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
 
+            attn_mask = None
+            is_causal = True
+            if past_len > 0:
+                # PyTorch's built-in causal mask for non-square attention is
+                # upper-left aligned, which is wrong for KV-cache decode.
+                # Build the lower-right mask explicitly so each query token can
+                # attend to the entire cache plus earlier tokens in this chunk.
+                total_len = past_len + seq_len
+                query_positions = past_len + torch.arange(seq_len, device=q.device)
+                key_positions = torch.arange(total_len, device=q.device)
+                attn_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                is_causal = False
+
             y = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
-                is_causal=True,
+                is_causal=is_causal,
                 scale=self.scale,
             )
 
@@ -140,13 +155,23 @@ class SimpleTransformerLM(nn.Module):
         return logits, new_kvs
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, min_p=None):
+    def generate(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        min_p=None,
+        repetition_penalty=1.0,
+    ):
         """
         Sampling hierarchy (applied in order, all optional):
-          1. temperature  — scale logits before any filtering
-          2. top-k        — keep only the k highest-logit tokens
-          3. top-p        — nucleus: smallest set whose cumulative prob >= p
-          4. min-p        — keep tokens where prob(i) >= min_p * prob(argmax)
+          1. repetition penalty — downweight tokens already seen in the prefix
+          2. temperature        — scale logits before any filtering
+          3. top-k              — keep only the k highest-logit tokens
+          4. top-p              — nucleus: smallest set whose cumulative prob >= p
+          5. min-p              — keep tokens where prob(i) >= min_p * prob(argmax)
                             adaptive: bar rises when model is confident,
                             falls when uncertain — best for killing rep loops
         """
@@ -166,6 +191,15 @@ class SimpleTransformerLM(nn.Module):
                     logits, past_kvs = self.forward(idx[:, -1:], past_kvs=past_kvs, use_cache=True)
  
                 logits = logits[:, -1, :]  # (B, vocab)
+
+                if repetition_penalty is not None and repetition_penalty > 1.0:
+                    seen_token_logits = torch.gather(logits, 1, idx)
+                    seen_token_logits = torch.where(
+                        seen_token_logits < 0,
+                        seen_token_logits * repetition_penalty,
+                        seen_token_logits / repetition_penalty,
+                    )
+                    logits.scatter_(1, idx, seen_token_logits)
  
                 if temperature <= 0:
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
@@ -227,9 +261,9 @@ def load_tinystories(enc):
     separator (token 50256) so the model learns story boundaries cleanly.
     """
     print("Loading TinyStories train split...")
-    train_text = load_hf_dataset("roneneldan/TinyStories", split="train")
+    train_text = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="train", return_list=True)
     print("Loading TinyStories validation split...")
-    val_text   = load_hf_dataset("roneneldan/TinyStories", split="validation")
+    val_text   = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="validation", return_list=True)
  
     eot = enc.eot_token  # <|endoftext|> = 50256
  
@@ -285,6 +319,8 @@ def main():
                         help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
     parser.add_argument("--block-size",   type=int,   default=1024)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
+    parser.add_argument("--resume",       action="store_true",
+                        help="Resume training from --checkpoint before running any new steps.")
     parser.add_argument("--compile-mode", type=str,   default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. max-autotune is best for Blackwell long runs "
@@ -298,6 +334,8 @@ def main():
     parser.add_argument("--min-p",          type=float, default=0.05,
                         help="Min-P threshold. Good default: 0.05-0.10. "
                              "Best lever against repetition loops.")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Downweight previously generated tokens. Good starting range: 1.05-1.20.")
     parser.add_argument("--max-new-tokens", type=int,   default=200)
     parser.add_argument("--prompt",         type=str,   default="Once upon a time",
                         help="Generation prompt. TinyStories-style prompts work best.")
@@ -384,6 +422,15 @@ def main():
  
     step       = 0
     train_iter = iter(train_loader)
+
+    if args.resume:
+        loaded_step = load_checkpoint(model, optimizer, args.checkpoint, device)
+        step = loaded_step + 1
+        if step >= max_steps:
+            print(
+                f"Checkpoint step {loaded_step} already reaches/exceeds "
+                f"--max-steps={max_steps}; skipping training."
+            )
  
     # BF16 autocast: Blackwell tensor cores have dedicated BF16 throughput paths.
     # GradScaler not needed for BF16 (no underflow risk unlike FP16).
@@ -434,7 +481,8 @@ def main():
     user_specified_sampling = (
         args.top_k is not None or
         args.top_p is not None or
-        args.min_p != 0.05  # non-default means user set it explicitly
+        args.min_p != 0.05 or
+        args.repetition_penalty != 1.0  # non-default means user set it explicitly
     )
  
     if args.no_sweep or user_specified_sampling:
@@ -444,15 +492,21 @@ def main():
                 top_k=args.top_k,
                 top_p=args.top_p,
                 min_p=args.min_p,
+                repetition_penalty=args.repetition_penalty,
             )
         }
     else:
         # Default: comparison sweep so you can see sampler differences at a glance.
+        print("Default temperature is 0.8")
+
         configs = {
-            "top_k=40  (baseline)":    dict(temperature=0.8, top_k=40,  top_p=None, min_p=None),
-            "top_p=0.9":               dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=None),
-            "min_p=0.05":              dict(temperature=0.8, top_k=None, top_p=None, min_p=0.05),
-            "top_p=0.9 + min_p=0.05": dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=0.05),
+            "top_k=40 ":               dict(temperature=0.8, top_k=40,   top_p=None, min_p=None, repetition_penalty=1.1),
+            "top_p=0.9":               dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=None, repetition_penalty=1.1),
+            "min_p=0.05":              dict(temperature=0.8, top_k=None, top_p=None, min_p=0.05, repetition_penalty=1.1),
+            "top_p=0.9 + min_p=0.05":  dict(temperature=0.8, top_k=None, top_p=0.9,  min_p=0.05, repetition_penalty=1.1),
+            "RepPenalty=1.2":          dict(temperature=0.8, top_k=None, top_p=None, min_p=None, repetition_penalty=1.2),
+            "Temp=0.5":                dict(temperature=0.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
+            "Temp=1.5":                dict(temperature=1.5, top_k=None, top_p=None, min_p=None, repetition_penalty=1.1),
         }
  
     for label, cfg in configs.items():
