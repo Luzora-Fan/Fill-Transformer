@@ -261,9 +261,9 @@ def load_tinystories(enc):
     separator (token 50256) so the model learns story boundaries cleanly.
     """
     print("Loading TinyStories train split...")
-    train_text = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="train", return_list=True)
+    train_text = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="train")
     print("Loading TinyStories validation split...")
-    val_text   = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="validation", return_list=True)
+    val_text   = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="validation")
  
     eot = enc.eot_token  # <|endoftext|> = 50256
  
