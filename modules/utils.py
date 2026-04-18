@@ -50,7 +50,7 @@ def load_checkpoint(
         return step, checkpoint
     return step
 
-def load_hf_dataset(dataset_name: str = "wikitext", config_name: str = "wikitext-2-v1", split: str = "train"):
+def load_hf_dataset(dataset_name: str = "wikitext", config_name: str = None, split: str = "train"):
     """Load a dataset from Hugging Face and combine text."""
     print(f"Loading {dataset_name} ({split}) from Hugging Face...")
     dataset = load_dataset(dataset_name, config_name, split=split)
