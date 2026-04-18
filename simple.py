@@ -315,13 +315,13 @@ def main():
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
-    parser.add_argument("--batch-size",   type=int,   default=99,
+    parser.add_argument("--batch-size",   type=int,   default=74,
                         help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
     parser.add_argument("--block-size",   type=int,   default=1024)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
     parser.add_argument("--resume",       action="store_true",
                         help="Resume training from --checkpoint before running any new steps.")
-    parser.add_argument("--compile-mode", type=str,   default="max-autotune",
+    parser.add_argument("--compile-mode", type=str,   default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. max-autotune is best for Blackwell long runs "
                              "but adds ~5-10 min warmup on the first step.")
