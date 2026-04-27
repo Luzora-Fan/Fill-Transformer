@@ -29,9 +29,9 @@ class SimpleTransformerLM(nn.Module):
         self,
         vocab_size,
         block_size=256,
-        n_layers=12,
-        n_heads=12,
-        n_embd=768,
+        n_layers=16,
+        n_heads=16,
+        n_embd=1024,
     ):
         super().__init__()
 
@@ -67,6 +67,17 @@ class SimpleTransformerLM(nn.Module):
             self.w_down.append(nn.Linear(hidden_dim, n_embd, bias=False))
 
         self.rope = RotaryEmbedding(self.head_dim, max_seq_len=block_size)
+     
+        # LayerScale (CaiT, Touvron et al. 2021) — learnable per-channel residual gates.
+        # Init to 0.1 for a ~100M-class model; use 1e-4 for deeper stacks (>24 layers).
+        _ls_init = 0.1
+        self.ls_attn = nn.ParameterList([
+            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
+        ])
+        self.ls_mlp = nn.ParameterList([
+            nn.Parameter(torch.full((n_embd,), _ls_init)) for _ in range(n_layers)
+        ])
+ 
         self.ln_f = RMSNorm(n_embd)
 
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
@@ -141,13 +152,13 @@ class SimpleTransformerLM(nn.Module):
 
             y = y.permute(0, 2, 1, 3).contiguous().view(bsz, seq_len, self.n_embd)
             y = self.proj[layer](y)
-            x = residual + y
+            x = residual + self.ls_attn[layer] * y
             residual = x
             x_norm = self.ln2[layer](x)
             up = self.w_up[layer](x_norm)
             gate = self.w_gate[layer](x_norm)
             mlp_out = self.w_down[layer](F.silu(gate) * up)
-            x = residual + mlp_out
+            x = residual + self.ls_mlp[layer] * mlp_out
             if use_cache: new_kvs.append((k, v))
 
         x = self.ln_f(x)
@@ -315,7 +326,7 @@ def main():
  
     # Training
     parser.add_argument("--max-steps",    type=int,   default=9999)
-    parser.add_argument("--batch-size",   type=int,   default=74,
+    parser.add_argument("--batch-size",   type=int,   default=99,
                         help="Per-step batch size. 192 fits comfortably on 96GB VRAM.")
     parser.add_argument("--block-size",   type=int,   default=1024)
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
