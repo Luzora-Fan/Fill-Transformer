@@ -29,9 +29,9 @@ class SimpleTransformerLM(nn.Module):
         self,
         vocab_size,
         block_size=256,
-        n_layers=16,
-        n_heads=16,
-        n_embd=1024,
+        n_layers=12,
+        n_heads=12,
+        n_embd=768,
     ):
         super().__init__()
 
