@@ -4,13 +4,12 @@ import random
 import argparse
 
 import torch
-import tiktoken
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from modules.layers import RMSNorm, RotaryEmbedding, apply_rope
-from modules.utils import load_checkpoint, load_hf_dataset, save_checkpoint
+from modules.utils import load_checkpoint, save_checkpoint, train_or_load_bpe
 
 # EPYC 9355: 48 cores / 96 threads. Cap PyTorch + MKL thread pools to avoid
 # contention with DataLoader workers (we use 12 workers below).
@@ -47,7 +46,6 @@ class SimpleTransformerLM(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        self.emb_scale = math.sqrt(n_embd)
 
         self.ln1 = nn.ModuleList([RMSNorm(n_embd) for _ in range(n_layers)])
         self.ln2 = nn.ModuleList([RMSNorm(n_embd) for _ in range(n_layers)])
@@ -107,7 +105,7 @@ class SimpleTransformerLM(nn.Module):
         if seq_len > self.block_size:
             raise ValueError("Sequence length exceeds block_size")
 
-        x = self.token_emb(idx) * self.emb_scale
+        x = self.token_emb(idx)
         new_kvs = [] if use_cache else None
         for layer in range(self.n_layers):
             residual = x
@@ -252,7 +250,6 @@ class SimpleTransformerLM(nn.Module):
 
 class TokenDataset(Dataset):
     def __init__(self, token_ids, block_size):
-        # Truncate to a multiple of block_size + 1 (to accommodate the target shift)
         length = len(token_ids) - (len(token_ids) - 1) % block_size
         self.token_ids = token_ids[:length]
         self.block_size = block_size
@@ -265,37 +262,42 @@ class TokenDataset(Dataset):
         y = self.token_ids[idx + 1 : idx + self.block_size + 1]
         return x, y
 
-def load_tinystories(enc):
+def load_tinystories(tokenizer, eot_id):
     """
-    Load roneneldan/TinyStories from HuggingFace and concatenate all stories
-    into a single token tensor. Stories are joined with the GPT-2 <|endoftext|>
-    separator (token 50256) so the model learns story boundaries cleanly.
+    Load roneneldan/TinyStories and tokenize with the provided custom BPE.
+    Stories are separated by <|endoftext|> so the model learns boundaries.
     """
-    print("Loading TinyStories train split...")
-    train_text = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="train")
-    print("Loading TinyStories validation split...")
-    val_text   = load_hf_dataset("roneneldan/TinyStories", config_name=None, split="validation")
- 
-    eot = enc.eot_token  # <|endoftext|> = 50256
- 
-    def encode_stories(text):
-        # load_hf_dataset returns a single concatenated string or a list —
-        # handle both cases gracefully.
-        if isinstance(text, list):
-            stories = text
-        else:
-            stories = text.split("<|endoftext|>")
- 
+    from datasets import load_dataset
+
+    print("Loading TinyStories splits...")
+    train_ds = load_dataset("roneneldan/TinyStories", split="train")
+    val_ds   = load_dataset("roneneldan/TinyStories", split="validation")
+
+    def encode_stories(ds):
         tokens = []
-        for story in stories:
-            story = story.strip()
-            if story:
-                tokens.extend(enc.encode(story))
-                tokens.append(eot)
+        # Batch-encode for speed.
+        batch = []
+        BATCH = 1024
+        def flush():
+            if not batch:
+                return
+            encs = tokenizer.encode_batch(batch)
+            for e in encs:
+                tokens.extend(e.ids)
+                tokens.append(eot_id)
+            batch.clear()
+        for row in ds:
+            t = row["text"].strip()
+            if not t:
+                continue
+            batch.append(t)
+            if len(batch) >= BATCH:
+                flush()
+        flush()
         return tokens
- 
-    train_tokens = encode_stories(train_text)
-    val_tokens   = encode_stories(val_text)
+
+    train_tokens = encode_stories(train_ds)
+    val_tokens   = encode_stories(val_ds)
  
     print(
         f"TinyStories: {len(train_tokens)/1e6:.1f}M train tokens, "
@@ -332,6 +334,10 @@ def main():
     parser.add_argument("--checkpoint",   type=str,   default="simple_checkpoint.pt")
     parser.add_argument("--resume",       action="store_true",
                         help="Resume training from --checkpoint before running any new steps.")
+    parser.add_argument("--vocab-size",     type=int, default=8192,
+                        help="Custom BPE vocab size. 8k is plenty for TinyStories.")
+    parser.add_argument("--tokenizer-path", type=str, default="tinystories_bpe.json",
+                        help="Path to cache the trained BPE tokenizer.")
     parser.add_argument("--compile-mode", type=str,   default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode. max-autotune is best for Blackwell long runs "
@@ -370,11 +376,26 @@ def main():
         print(f"GPU : {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
  
-    enc    = tiktoken.get_encoding("gpt2")
-    encode = enc.encode
-    decode = enc.decode
- 
-    train_data, val_data = load_tinystories(enc)
+    # Custom BPE — much smaller vocab than GPT-2's 50257 since TinyStories'
+    # vocabulary is tiny. Trains once and caches to disk.
+    def corpus_iter():
+        from datasets import load_dataset
+        ds = load_dataset("roneneldan/TinyStories", split="train")
+        for row in ds:
+            t = row["text"].strip()
+            if t:
+                yield t
+
+    tokenizer = train_or_load_bpe(
+        corpus_iter(),
+        vocab_size=args.vocab_size,
+        save_path=args.tokenizer_path,
+    )
+    eot_id = tokenizer.token_to_id("<|endoftext|>")
+    encode = lambda s: tokenizer.encode(s).ids
+    decode = lambda ids: tokenizer.decode(ids)
+
+    train_data, val_data = load_tinystories(tokenizer, eot_id)
  
     block_size = args.block_size
  
@@ -395,7 +416,7 @@ def main():
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, **loader_kwargs)
  
     # Pad vocab size to a multiple of 64 for aligned matmuls
-    vocab_size        = enc.n_vocab
+    vocab_size        = tokenizer.get_vocab_size()
     padded_vocab_size = ((vocab_size + 63) // 64) * 64
  
     model = SimpleTransformerLM(
@@ -457,11 +478,11 @@ def main():
         except StopIteration:
             train_iter = iter(train_loader)
             xb, yb = next(train_iter)
- 
+
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
- 
+
         with autocast_ctx:
             logits, _ = model(xb, use_cache=False)
             loss = F.cross_entropy(logits.view(-1, model.vocab_size), yb.view(-1))
@@ -528,7 +549,7 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 **cfg,
             )
-        print(decode(out[0].tolist()))
+        print(decode(list(out[0].tolist())))
         print()
 
 if __name__ == "__main__":

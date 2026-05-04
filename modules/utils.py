@@ -4,6 +4,42 @@ from pathlib import Path
 from datasets import load_dataset
 from typing import Optional
 
+
+def train_or_load_bpe(corpus_iter, vocab_size: int, save_path: str):
+    """
+    Train a byte-level BPE tokenizer on `corpus_iter` (yields strings) and
+    cache it at save_path. Reuses the cached file on subsequent runs.
+
+    Reserves a single special token <|endoftext|> at id 0.
+    Returns a `tokenizers.Tokenizer` instance.
+    """
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers.trainers import BpeTrainer
+    from tokenizers.pre_tokenizers import ByteLevel as BLPre
+    from tokenizers.decoders import ByteLevel as BLDec
+
+    p = Path(save_path)
+    if p.exists():
+        print(f"Loading cached tokenizer from {save_path}")
+        return Tokenizer.from_file(save_path)
+
+    print(f"Training BPE tokenizer (vocab={vocab_size}) on corpus...")
+    tok = Tokenizer(BPE(unk_token="<|unk|>"))
+    tok.pre_tokenizer = BLPre(add_prefix_space=False)
+    tok.decoder = BLDec()
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=["<|endoftext|>", "<|unk|>"],
+        initial_alphabet=BLPre.alphabet(),
+        show_progress=True,
+    )
+    tok.train_from_iterator(corpus_iter, trainer=trainer)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tok.save(save_path)
+    print(f"Tokenizer saved to {save_path} (vocab={tok.get_vocab_size()})")
+    return tok
+
 def init_weights(module: nn.Module, std: float = 0.02):
     """GPT-2 style weight initialization."""
     if isinstance(module, (nn.Linear, nn.Embedding)):
